@@ -271,21 +271,23 @@ class DeterministicPhysicsEngine:
         self.min_time_step = self.dt
         self.max_time_step = 0
 
-        # Инициализируем balls и walls как None
+        # Инициализируем balls, walls и pegs как None
         self.balls = None
         self.walls = None
+        self.pegs = None
 
-    def set_objects(self, balls: List, walls: List):
+    def set_objects(self, balls: List, walls: List, pegs: List = None):
         """Установка объектов симуляции и заполнение статических данных"""
         self.balls = [b.copy() for b in balls]
         self.walls = walls
+        self.pegs = pegs if pegs is not None else []
 
         # Заполняем статические объекты в шаблоне
         self._fill_static_objects()
 
     def _calculate_world_bounds(self):
-        """Автоматически вычисляет границы мира на основе стен и шаров"""
-        if not self.walls:
+        """Автоматически вычисляет границы мира на основе стен, шаров и пегов"""
+        if not self.walls and not self.pegs:
             return {'xmin': -6, 'xmax': 6, 'ymin': -4, 'ymax': 4}
 
         # Собираем все точки стен
@@ -301,26 +303,29 @@ class DeterministicPhysicsEngine:
             for ball in self.balls:
                 ball_positions.append(ball[0])  # позиция
                 ball_radii.append(ball[2])  # радиус
+        
+        # Собираем позиции и радиусы пегов
+        if self.pegs:
+            for peg in self.pegs:
+                all_points.append(peg[0])
+                ball_radii.append(peg[1])
 
         # Преобразуем в numpy массив для удобства
         points_array = np.array(all_points)
 
-        # Вычисляем границы по стенам
+        # Вычисляем границы
         xmin = np.min(points_array[:, 0])
         xmax = np.max(points_array[:, 0])
         ymin = np.min(points_array[:, 1])
         ymax = np.max(points_array[:, 1])
 
-        # Учитываем радиусы шаров (если есть шары)
-        if ball_positions and ball_radii:
-            ball_array = np.array(ball_positions)
-            max_radius = max(ball_radii) if ball_radii else 0
-
-            # Расширяем границы с учетом максимального радиуса
-            xmin = min(xmin, np.min(ball_array[:, 0]) - max_radius)
-            xmax = max(xmax, np.max(ball_array[:, 0]) + max_radius)
-            ymin = min(ymin, np.min(ball_array[:, 1]) - max_radius)
-            ymax = max(ymax, np.max(ball_array[:, 1]) + max_radius)
+        # Учитываем радиусы шаров и пегов
+        if ball_radii:
+            max_radius = max(ball_radii)
+            xmin -= max_radius
+            xmax += max_radius
+            ymin -= max_radius
+            ymax += max_radius
 
         # Добавляем небольшой отступ (% от размера)
         x_padding = (xmax - xmin) * 0.05
@@ -335,10 +340,14 @@ class DeterministicPhysicsEngine:
 
     def _fill_static_objects(self):
         """Заполняет статические объекты в схеме"""
-        # Очищаем предыдущие стены
+        # Очищаем предыдущие статические объекты
         self.result_template['static_objects']['walls'] = []
+        if 'pegs' not in self.result_template['static_objects']:
+            self.result_template['static_objects']['pegs'] = []
+        else:
+            self.result_template['static_objects']['pegs'] = []
 
-        # Добавляем стены как статические объекты
+        # Добавляем стены
         for i, (A, B) in enumerate(self.walls):
             wall_obj = {
                 'type': 'wall',
@@ -348,9 +357,24 @@ class DeterministicPhysicsEngine:
                 'color': 'black',
                 'linewidth': 2,
                 'style': '-',
-                'tags': ['always']  # Стены всегда отображаются
+                'tags': ['always']
             }
             self.result_template['static_objects']['walls'].append(wall_obj)
+
+        # Добавляем пеги
+        for i, (pos, r, color) in enumerate(self.pegs):
+            peg_obj = {
+                'type': 'circle',
+                'id': f'peg_{i}',
+                'position': pos.tolist() if hasattr(pos, 'tolist') else pos,
+                'radius': float(r),
+                'color': color,
+                'edgecolor': 'black',
+                'linewidth': 1.5,
+                'tags': ['always'],
+                'properties': {'static': True}
+            }
+            self.result_template['static_objects']['pegs'].append(peg_obj)
 
         # Вычисляем автоматические границы мира
         world_bounds = self._calculate_world_bounds()
@@ -557,8 +581,16 @@ class DeterministicPhysicsEngine:
     def compute_state_hash(self, frame_idx: int = -1) -> str:
         """Вычисление хеша состояния для верификации детерминированности"""
         if frame_idx == -1:
-            # Хеш всей симуляции
-            state_data = f"{self.balls}{self.walls}{self.fps}{self.sim_time}{self.seed}"
+            # Хеш всей симуляции (включая результат, если он есть)
+            if self.result_template['frames']:
+                # Хешируем позиции всех объектов в последнем кадре
+                last_frame = self.result_template['frames'][-1]
+                positions = []
+                for obj in last_frame['objects']['circles']:
+                    positions.append((obj['position'], obj['velocity']))
+                state_data = f"{self.balls}{self.walls}{self.pegs}{self.seed}{positions}"
+            else:
+                state_data = f"{self.balls}{self.walls}{self.pegs}{self.fps}{self.sim_time}{self.seed}"
         else:
             # Хеш конкретного кадра
             frame = self.result_template['frames'][frame_idx]
@@ -589,11 +621,11 @@ class DeterministicPhysicsEngine:
         print(f"Добавлен кадр 0")
 
         # Основной цикл симуляции
-        progress_interval = max(1, self.total_frames // 10)  # Увеличили частоту вывода
+        progress_interval = max(1, self.total_frames // 10)
 
         for frame in range(1, self.total_frames):
-            # Теперь получаем три значения
-            balls_state, collisions, trajectory_points = self.update_physics(balls_state, self.walls, self.dt)
+            # Передаем self.pegs в update_physics
+            balls_state, collisions, trajectory_points = self.update_physics(balls_state, self.walls, self.pegs, self.dt)
 
             # Передаем trajectory_points в создание кадра
             frame_data = self._create_frame_data(balls_state, frame, collisions, trajectory_points)
@@ -761,13 +793,12 @@ class DeterministicPhysicsEngine:
 
         return new_vel1, new_vel2
 
-    def update_physics(self, balls, walls, dt):
-        """Обновление физики за временной шаг с сохранением промежуточных позиций"""
+    def update_physics(self, balls, walls, pegs, dt):
+        """Обновление физики за временной шаг с использованием пространственной сетки (Broad-phase)"""
         new_balls = [b.copy() for b in balls]
         collision_events = []
-        trajectory_points = [[] for _ in range(len(balls))]  # Промежуточные позиции для каждого шара
+        trajectory_points = [[] for _ in range(len(balls))]
 
-        # Сохраняем начальные позиции
         for i in range(len(new_balls)):
             trajectory_points[i].append(new_balls[i][0].copy())
 
@@ -775,12 +806,43 @@ class DeterministicPhysicsEngine:
         iterations = 0
         max_iterations = 100
 
+        # Определяем размер ячейки сетки (максимальный диаметр + запас на движение)
+        max_r = 0
+        if balls:
+            max_r = max(max_r, max(b[2] for b in balls))
+        if pegs:
+            max_r = max(max_r, max(p[1] for p in pegs))
+        
+        # Размер ячейки должен быть достаточно большим, чтобы покрыть движение шара за шаг
+        # Но не слишком большим, чтобы сохранять эффективность.
+        cell_size = max_r * 4 if max_r > 0 else 1.0
+
+        def get_cell(pos):
+            return (int(pos[0] / cell_size), int(pos[1] / cell_size))
+
         while remaining_time > 1e-12 and iterations < max_iterations:
             iterations += 1
             earliest_t = remaining_time
             collision_info = None
 
-            # Столкновения со стенами
+            # Построение сетки для текущей итерации
+            grid = {}
+            # Добавляем шары в сетку
+            for i, (pos, vel, r, color) in enumerate(new_balls):
+                cell = get_cell(pos)
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        neighbor = (cell[0] + dx, cell[1] + dy)
+                        if neighbor not in grid: grid[neighbor] = {'balls': [], 'pegs': [], 'walls': []}
+                        grid[neighbor]['balls'].append(i)
+            
+            # Добавляем пеги в сетку (они статичны, но для простоты добавим в ту же сетку)
+            for i, (pos, r, color) in enumerate(pegs):
+                cell = get_cell(pos)
+                if cell not in grid: grid[cell] = {'balls': [], 'pegs': [], 'walls': []}
+                grid[cell]['pegs'].append(i)
+
+            # Проверка столкновений шаров со стенами (стены пока проверяем все, так как они длинные)
             for i, (pos, vel, r, color) in enumerate(new_balls):
                 for A, B in walls:
                     result = self.collide_line_time_with_normal(pos, vel, r, A, B)
@@ -788,22 +850,38 @@ class DeterministicPhysicsEngine:
                         earliest_t = result[0]
                         collision_info = ('wall', i, result[1], result[2], A, B)
 
-            # Столкновения между шарами
-            for i in range(len(new_balls)):
-                for j in range(i + 1, len(new_balls)):
-                    pos1, vel1, r1, color1 = new_balls[i]
-                    pos2, vel2, r2, color2 = new_balls[j]
-                    t_col = self.collide_circle_time(pos1, vel1, r1, pos2, vel2, r2)
-                    if t_col is not None and t_col <= earliest_t:
-                        earliest_t = t_col
-                        collision_info = ('circle', i, j)
+            # Проверка столкновений шаров с пегами (используем сетку)
+            for i, (pos, vel, r, color) in enumerate(new_balls):
+                cell = get_cell(pos)
+                if cell in grid:
+                    for peg_idx in grid[cell]['pegs']:
+                        peg_pos, peg_r, _ = pegs[peg_idx]
+                        t_col = self.collide_circle_time(pos, vel, r, peg_pos, np.zeros(2), peg_r)
+                        if t_col is not None and t_col <= earliest_t:
+                            earliest_t = t_col
+                            collision_info = ('peg', i, peg_idx)
+
+            # Проверка столкновений между шарами (используем сетку)
+            checked_pairs = set()
+            for cell_coord, cell_data in grid.items():
+                cell_balls = cell_data['balls']
+                for idx_in_list, i in enumerate(cell_balls):
+                    for j in cell_balls[idx_in_list + 1:]:
+                        pair = tuple(sorted((i, j)))
+                        if pair in checked_pairs: continue
+                        checked_pairs.add(pair)
+                        
+                        pos1, vel1, r1, color1 = new_balls[i]
+                        pos2, vel2, r2, color2 = new_balls[j]
+                        t_col = self.collide_circle_time(pos1, vel1, r1, pos2, vel2, r2)
+                        if t_col is not None and t_col <= earliest_t:
+                            earliest_t = t_col
+                            collision_info = ('circle', i, j)
 
             if collision_info is None:
-                # Нет столкновений - двигаем все шары до конца
                 for i in range(len(new_balls)):
                     pos, vel, r, color = new_balls[i]
                     new_balls[i][0] = pos + vel * remaining_time
-                    # Сохраняем конечную позицию
                     trajectory_points[i].append(new_balls[i][0].copy())
                 break
 
@@ -811,7 +889,6 @@ class DeterministicPhysicsEngine:
             for i in range(len(new_balls)):
                 pos, vel, r, color = new_balls[i]
                 new_balls[i][0] = pos + vel * earliest_t
-                # Сохраняем позицию перед столкновением
                 trajectory_points[i].append(new_balls[i][0].copy())
 
             # Обрабатываем столкновение
@@ -825,6 +902,23 @@ class DeterministicPhysicsEngine:
                     'normal': normal.copy(),
                     'wall_type': col_type,
                     'wall_points': (A.copy(), B.copy())
+                })
+                new_balls[ball_idx][1] = self.reflect_vector(new_balls[ball_idx][1], normal)
+                self.collision_count += 1
+            elif collision_info[0] == 'peg':
+                _, ball_idx, peg_idx = collision_info
+                peg_pos, peg_r, _ = pegs[peg_idx]
+                collision_vector = new_balls[ball_idx][0] - peg_pos
+                dist = np.linalg.norm(collision_vector)
+                normal = collision_vector / dist if dist > 1e-12 else np.array([0, 1])
+                
+                collision_point = peg_pos + normal * peg_r
+                collision_events.append({
+                    'type': 'wall', # Пеги отображаем как столкновение со стеной для простоты
+                    'ball_index': ball_idx,
+                    'point': collision_point.copy(),
+                    'normal': normal.copy(),
+                    'wall_type': 'peg'
                 })
                 new_balls[ball_idx][1] = self.reflect_vector(new_balls[ball_idx][1], normal)
                 self.collision_count += 1
@@ -849,4 +943,4 @@ class DeterministicPhysicsEngine:
             self.numerical_issues += 1
             print(f"Предупреждение: достигнут предел итераций. Осталось времени: {remaining_time:.6f}")
 
-        return new_balls, collision_events, trajectory_points  # Возвращаем также точки траектории
+        return new_balls, collision_events, trajectory_points
